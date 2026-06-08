@@ -42,7 +42,8 @@ Typical motivations are:
 On the current validation setup, the VCL backend showed:
 
 - a strong advantage over `posix` and `io_uring` on small-block (`4K`) traffic
-- parity with `io_uring` on large-block (`64K`) throughput
+- competitive large-block (`64K`) read throughput and a strong `64K` write
+  advantage over the classic Linux socket backends
 - near line-rate with jumbo frames once the descriptor depth and queueing model
   were tuned correctly
 
@@ -77,8 +78,8 @@ At the time of writing:
 
 The main areas changed by this work are:
 
-- [`module/sock/vcl/vcl.c`](/home/jtollet/spdk/module/sock/vcl/vcl.c)
-- [`lib/nvmf/tcp.c`](/home/jtollet/spdk/lib/nvmf/tcp.c)
+- [`module/sock/vcl/vcl.c`](vcl.c)
+- [`lib/nvmf/tcp.c`](../../../lib/nvmf/tcp.c)
 
 Recent key commits on the branch include:
 
@@ -225,19 +226,20 @@ This avoids under-provisioning NIC queueing when VPP worker count increases.
 
 ### Jumbo Frames
 
-For jumbo traffic, ring depth mattered a lot.
+For jumbo traffic, ring depth, VPP buffer size and RDMA receive mode mattered a
+lot. Early validation needed deeper rings to avoid instability. With the fixed
+RDMA striding-RQ buffer accounting, the current best jumbo point on this setup
+uses:
 
-Observed conclusion on the current setup:
-
-- `2048` descriptors: unstable for the problematic jumbo case
-- `2560` descriptors: still unstable
-- `3072` descriptors: first clearly stable point
-- `3584` descriptors: stable and conservative
-
-For current `MTU 9000` testing, the practical recommendation is:
-
-- `num-rx-desc = 3072`
-- `num-tx-desc = 3072`
+- `MTU 9000`
+- VPP `default data-size 10240`
+- RDMA `striding-rq` enabled
+- hardware checksum offload enabled
+- TSO disabled for the best jumbo VCL point
+- SPDK target mask `0x3` (two reactors)
+- SPDK initiator `P=2`
+- target RX/TX descriptors `1024`
+- initiator RX/TX descriptors `2048`
 
 ### NUMA Awareness
 
@@ -249,42 +251,72 @@ Keep SPDK, VPP workers, and NIC queues aligned as much as possible:
 
 ## Performance Summary
 
-The numbers below are the best points observed on the current lab setup.
-They are not universal, but they show the relative positioning of the backends
-under the same environment.
+The numbers below are the best points observed on the current lab setup. They
+are not universal, but they show the relative positioning of the backends under
+the same environment.
 
-### `MTU 1500` Best Observed Throughput
+This is an architectural comparison, not a fixed-core-budget microbenchmark.
+The current classic SPDK and VCL target runs both use a two-reactor SPDK target,
+but the networking CPU is spent in different places: Linux uses kernel TCP,
+softirq, NAPI and driver paths, while VCL uses VPP host-stack processing.
 
-| Backend | 4K randread | 4K randwrite | 64K randread | 64K randwrite |
-|---|---:|---:|---:|---:|
-| `vcl` | `3827.95 MiB/s` | `3522.81 MiB/s` | `4473.95 MiB/s` | `4451.81 MiB/s` |
-| `io_uring` | `2636.13 MiB/s` | `2364.99 MiB/s` | `4452.04 MiB/s` | `4468.61 MiB/s` |
-| `posix` | `1219.32 MiB/s` | `925.07 MiB/s` | `2645.06 MiB/s` | `1341.44 MiB/s` |
+### Current `MTU 9000`: Classic SPDK vs SPDK + VCL
 
-Takeaway:
+Current best validated runs use a 45-second window.
 
-- `vcl` is clearly ahead on `4K`
-- `vcl` is at parity with `io_uring` on `64K`
-- `vcl` is far ahead of `posix`
-
-### `MTU 9000` Best Observed VCL Point
-
-Current jumbo sweet spot observed:
-
-- `VPP_WORKERS=1`
-- `SPDK_WORKERS=2`
-- `P=2`
-- `num-rx-desc = num-tx-desc = 3072`
-
-Observed:
-
-- `64K randread`: `4707.69 MiB/s`
-- `64K randwrite`: `4587.77 MiB/s`
+| Workload | Best classic SPDK | SPDK + VCL | VCL lead |
+|---|---:|---:|---:|
+| `4K randread` | `3027.66 MiB/s` (`io_uring`) | `4638.42 MiB/s` | `+53.2%` |
+| `4K randwrite` | `2770.09 MiB/s` (`io_uring`) | `4972.24 MiB/s` | `+79.5%` |
+| `4K randrw 70/30` | `3190.93 MiB/s` (`io_uring`) | `4605.58 MiB/s` | `+44.3%` |
+| `64K randread` | `4734.80 MiB/s` (`posix`) | `5241.31 MiB/s` | `+10.7%` |
+| `64K randwrite` | `3464.24 MiB/s` (`posix`) | `5065.81 MiB/s` | `+46.2%` |
 
 Takeaway:
 
-- with the right descriptor depth and worker count, VCL reaches near line-rate
-  in jumbo mode
+- `io_uring` is the strongest classic backend for `4K` in these tests
+- `posix` is the strongest classic backend for `64K` in these tests
+- `vcl` is ahead of the best classic backend on every listed workload
+- the largest current VCL advantage is on `4K randwrite`
+
+### Current `MTU 1500`: SPDK + VCL
+
+Current validated VCL runs at `MTU 1500` use a 45-second window.
+
+| Workload | SPDK + VCL |
+|---|---:|
+| `4K randread` | `4150.58 MiB/s` |
+| `4K randwrite` | `4414.38 MiB/s` |
+| `4K randrw 70/30` | `4481.91 MiB/s` |
+| `64K randread` | `4337.58 MiB/s` |
+| `64K randwrite` | `4444.12 MiB/s` |
+
+Compared with the previous `MTU 1500` VCL results, the current setup improves
+`4K randread` by `+8.4%` and `4K randwrite` by `+25.3%`. `64K` remains roughly
+flat: `64K randread` is `-3.0%` and `64K randwrite` is `-0.2%`.
+
+### Previous Published `MTU 9000` Baseline
+
+The previous public comparison used `MTU 9000`, `QD64`, a 5-second window, TSO
+enabled, and 2048 RX/TX descriptors.
+
+| Workload | `vcl` | `posix` | `io_uring` |
+|---|---:|---:|---:|
+| `4K randread` | `1579.95 MiB/s` | `961.59 MiB/s` | `978.93 MiB/s` |
+| `4K randwrite` | `1048.88 MiB/s` | `947.62 MiB/s` | `1050.92 MiB/s` |
+| `64K randread` | `3284.29 MiB/s` | `2118.84 MiB/s` | `2273.67 MiB/s` |
+| `64K randwrite` | `2943.88 MiB/s` | `2009.51 MiB/s` | `2085.30 MiB/s` |
+
+Compared with that previous VCL baseline, the current tuned VCL path reaches:
+
+- `4K randread`: `2.94x`
+- `4K randwrite`: `4.74x`
+- `64K randread`: `1.60x`
+- `64K randwrite`: `1.72x`
+
+The main shift is `4K randwrite`: in the previous public results VCL was
+effectively tied with `io_uring`; in the current setup, VCL is `+79.5%` ahead
+of the current best classic SPDK backend on that workload.
 
 ## Benchmarking Recipes
 
@@ -361,7 +393,7 @@ is a practical starting point.
 
 ## Related Files
 
-- [`module/sock/vcl/vcl.c`](/home/jtollet/spdk/module/sock/vcl/vcl.c)
-- [`lib/nvmf/tcp.c`](/home/jtollet/spdk/lib/nvmf/tcp.c)
-- [`doc/vcl_sock.md`](/home/jtollet/spdk/doc/vcl_sock.md)
+- [`module/sock/vcl/vcl.c`](vcl.c)
+- [`lib/nvmf/tcp.c`](../../../lib/nvmf/tcp.c)
+- [`doc/vcl_sock.md`](../../../doc/vcl_sock.md)
 
